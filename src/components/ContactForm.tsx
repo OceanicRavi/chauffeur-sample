@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Phone, Mail, MapPin, Calendar, Users, Send } from 'lucide-react';
+import WebCallButton from './WebCallButton';
 
 const ContactForm = () => {
   const [formData, setFormData] = useState({
@@ -52,6 +53,17 @@ const ContactForm = () => {
                   <h3 className="text-white font-semibold mb-2">Phone</h3>
                   <p className="text-gray-300">+64 9 XXX XXXX</p>
                   <p className="text-gray-400 text-sm">Available 24/7 for bookings</p>
+                </div>
+              </div>
+
+              <div className="flex items-start gap-4">
+                <div className="bg-teal-600/20 w-12 h-12 rounded-full flex items-center justify-center flex-shrink-0">
+                  <Phone className="w-6 h-6 text-teal-400" />
+                </div>
+                <div>
+                  <h3 className="text-white font-semibold mb-2">Voice Call</h3>
+                  <p className="text-gray-300 mb-3">Speak directly with our team</p>
+                  <WebCallButton />
                 </div>
               </div>
 

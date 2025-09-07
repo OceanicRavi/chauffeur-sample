@@ -1,5 +1,6 @@
 import React from 'react';
 import { Phone, Mail, ChevronRight } from 'lucide-react';
+import WebCallButton from './WebCallButton';
 
 const CallToAction = () => {
   return (
@@ -15,11 +16,13 @@ const CallToAction = () => {
             Book your premium chauffeur service today and discover the difference that true luxury makes.
           </p>
 
-          <div className="flex flex-col sm:flex-row gap-4 justify-center items-center">
+          <div className="flex flex-col sm:flex-row gap-6 justify-center items-center">
             <button className="group bg-teal-600 hover:bg-teal-700 text-white px-8 py-4 rounded-full text-lg font-medium transition-all duration-300 hover:shadow-2xl hover:shadow-teal-500/25 flex items-center gap-3">
               Request a Quote
               <ChevronRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
             </button>
+            
+            <WebCallButton />
             
             <div className="flex items-center gap-6 text-gray-300">
               <a href="tel:+64-9-XXX-XXXX" className="flex items-center gap-2 hover:text-teal-400 transition-colors">

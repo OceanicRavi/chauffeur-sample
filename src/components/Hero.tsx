@@ -1,5 +1,6 @@
 import React from 'react';
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, Phone } from 'lucide-react';
+import WebCallButton from './WebCallButton';
 
 const Hero = () => {
   return (
@@ -27,10 +28,16 @@ const Hero = () => {
             and personalized service for every journey.
           </p>
 
-          <button className="group bg-teal-600 hover:bg-teal-700 text-white px-12 py-4 rounded-full text-lg font-medium transition-all duration-300 transform hover:scale-105 hover:shadow-2xl hover:shadow-teal-500/25 flex items-center gap-3 mx-auto">
-            Book a Ride
-            <ChevronRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
-          </button>
+          <div className="flex flex-col sm:flex-row gap-6 items-center justify-center">
+            <button className="group bg-teal-600 hover:bg-teal-700 text-white px-12 py-4 rounded-full text-lg font-medium transition-all duration-300 transform hover:scale-105 hover:shadow-2xl hover:shadow-teal-500/25 flex items-center gap-3">
+              Book a Ride
+              <ChevronRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
+            </button>
+            
+            <div className="flex flex-col items-center">
+              <WebCallButton />
+            </div>
+          </div>
         </div>
       </div>
 
