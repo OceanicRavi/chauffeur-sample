@@ -1,7 +1,6 @@
-// File: api/create-web-call.js
-import Retell from 'retell-sdk';
+const { Retell } = require('retell-sdk');
 
-export default async function handler(req, res) {
+module.exports = async (req, res) => {
   // Set CORS headers
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -11,11 +10,13 @@ export default async function handler(req, res) {
     'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
   );
 
+  // Handle preflight OPTIONS request
   if (req.method === 'OPTIONS') {
     res.status(200).end();
     return;
   }
 
+  // Only allow POST requests
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -27,6 +28,7 @@ export default async function handler(req, res) {
       });
     }
 
+    // Initialize Retell client
     const retell = new Retell({
       apiKey: process.env.RETELL_API_KEY,
     });
@@ -40,6 +42,7 @@ export default async function handler(req, res) {
       }
     });
     
+    // Send the access token back to the browser
     res.status(200).json({ accessToken: response.access_token });
   } catch (err) {
     console.error('Error creating web call:', err);
@@ -48,4 +51,4 @@ export default async function handler(req, res) {
       details: err.message 
     });
   }
-}
+};
