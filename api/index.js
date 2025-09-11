@@ -1,6 +1,6 @@
-const express = require('express');
-const Retell = require('retell-sdk').default;
-const cors = require('cors');
+import express from 'express';
+import { Retell } from 'retell-sdk';
+import cors from 'cors';
 
 const app = express();
 
@@ -51,4 +51,4 @@ app.get('/api/health', (req, res) => {
 });
 
 // Export the Express app for Vercel
-module.exports = app;
+export default app;
