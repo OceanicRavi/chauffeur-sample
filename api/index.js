@@ -2,10 +2,8 @@ import express from 'express';
 import { Retell } from 'retell-sdk';
 import cors from 'cors';
 import multer from 'multer';
-import pdf from 'pdf-parse';
+import PDFParser from 'pdf2json';
 import XLSX from 'xlsx';
-import path from 'path';
-import fs from 'fs';
 
 const app = express();
 
@@ -13,231 +11,312 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Set up multer for file uploads
-const upload = multer({
-  dest: 'uploads/',
+// Set up multer for file uploads (in-memory)
+const upload = multer({ 
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: 10 * 1024 * 1024 // 10MB limit
-  },
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype === 'application/pdf') {
-      cb(null, true);
-    } else {
-      cb(new Error('Only PDF files are allowed'));
-    }
   }
 });
-
-// Password for PDF processing (set this in your environment variables)
-const PDF_PROCESS_PASSWORD = process.env.PDF_PROCESS_PASSWORD || 'chauffeur2025';
 
 // Initialize Retell client with your secret API key
 const retell = new Retell({
   apiKey: process.env.RETELL_API_KEY,
 });
 
+// ---------------------------------------------------------
+// ---------------- PDF → EXCEL LOGIC (from server.js) -----
+// ---------------------------------------------------------
 
-// Function to parse PDF and extract table data
-function parsePDFData(text) {
-  const lines = text.split('\n');
-  const bookings = [];
-  let isInTable = false;
+/**
+ * Parse PDF buffer with pdf2json and return raw Pages
+ */
+function parsePDFFromBuffer(buf) {
+  return new Promise((resolve, reject) => {
+    const pdfParser = new PDFParser();
+    pdfParser.on('pdfParser_dataError', (err) => reject(err?.parserError || err));
+    pdfParser.on('pdfParser_dataReady', (pdfData) => {
+      resolve(pdfData?.Pages ?? []);
+    });
+    pdfParser.parseBuffer(buf);
+  });
+}
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
+/**
+ * Decode a single pdf2json text item into a string
+ */
+function decodeTextItem(t) {
+  if (!t?.R) return '';
+  return t.R.map((r) => decodeURIComponent(r?.T || '')).join(' ');
+}
 
-    // Look for table headers or booking numbers to identify table rows
-    if (line.match(/^\d+\s+\d{8,}\s+\d{4}-\d{2}-\d{2}/)) {
-      // This looks like a booking row: # BookingNo AcceptDate ...
-      const parts = line.split(/\s+/);
-      if (parts.length >= 10) {
-        try {
-          const booking = {
-            bookingNo: parts[1],
-            acceptDate: parts[2],
-            rideDate: parts[3] + ' ' + parts[4],
-            driver: parts[5] + (parts[6] && !parts[6].match(/^[A-Z]{3}\d+/) ? ' ' + parts[6] : ''),
-            licensePlate: parts.find(p => p.match(/^[A-Z]{3}\d+/)) || '',
-            pickup: '',
-            destination: '',
-            netAmount: '',
-            waitingCharge: '0.00',
-            addedKm: '0.00',
-            gst: '',
-            total: ''
-          };
+/**
+ * Convert a Page into ordered text lines by grouping close Y values and sorting by X
+ */
+function pageToLines(page) {
+  if (!page?.Texts) return [];
+  const items = page.Texts
+    .map((t) => ({ x: t.x, y: t.y, s: decodeTextItem(t).trim() }))
+    .filter((i) => i.s);
 
-          // Extract pickup and destination (look for patterns)
-          const restOfLine = parts.slice(7).join(' ');
-          const addressPattern = /(.+?)\s+(.+?)\s+0\.00%\s+([\d,]+\.?\d*)\s+NZ\$/;
-          const match = restOfLine.match(addressPattern);
+  // group by y cluster (fixed precision); then order rows by y asc, and within row by x asc
+  const rows = new Map();
+  for (const it of items) {
+    const key = it.y.toFixed(1);
+    if (!rows.has(key)) rows.set(key, []);
+    rows.get(key).push(it);
+  }
 
-          if (match) {
-            booking.pickup = match[1].trim();
-            booking.destination = match[2].trim();
-            booking.netAmount = match[3];
+  const orderedLines = [];
+  for (const [, arr] of [...rows.entries()].sort((a, b) => parseFloat(a[0]) - parseFloat(b[0]))) {
+    const text = arr.sort((a, b) => a.x - b.x).map((x) => x.s).join(' ');
+    orderedLines.push(text);
+  }
+  return orderedLines;
+}
 
-            // Look for amounts in the line
-            const amounts = restOfLine.match(/([\d,]+\.?\d*)\s+NZ\$/g);
-            if (amounts && amounts.length >= 3) {
-              booking.netAmount = amounts[0].replace(' NZ$', '');
-              booking.waitingCharge = amounts[1].replace(' NZ$', '');
-              booking.addedKm = amounts[2] ? amounts[2].replace(' NZ$', '') : '0.00';
-              booking.gst = amounts[amounts.length - 2] ? amounts[amounts.length - 2].replace(' NZ$', '') : '';
-              booking.total = amounts[amounts.length - 1].replace(' NZ$', '');
-            }
-          }
+/**
+ * Try to parse one whole, multi-line row string into the exact columns requested
+ */
+function tryParseRow(row) {
+  // Booking No: 9-digit id
+  const booking = (row.match(/\b\d{9}\b/) || [])[0] || '';
 
-          bookings.push(booking);
-        } catch (error) {
-          console.error('Error parsing line:', line, error);
-        }
-      }
+  // Heuristic: allow "fee back / credit" style rows with no booking
+  const isCreditRow = /fee\s+for\s+ride\s+given\s+back|credit|refund/i.test(row);
+
+  if (!booking && !isCreditRow) return null;
+
+  // Accept date / Ride date (yyyy-mm-dd), time (HH:mm)
+  const dates = row.match(/\b\d{4}-\d{2}-\d{2}\b/g) || [];
+  const rideTime = (row.match(/\b\d{2}:\d{2}\b/) || [])[0] || '';
+
+  // Driver: capitalized words (1–3) not colliding with address tokens
+  const driver =
+    (row.match(
+      /\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b(?!\s*(Road|Street|Drive|Avenue|Airport|Hotel|International))/,
+    ) || [])[0] || '';
+
+  // License plate: support personalized/all-letter plates
+  const plateCandidates = Array.from(row.matchAll(/\b[A-Z0-9]{2,8}\b/g))
+    .map(m => m[0])
+    .filter(tok => {
+      if (/^\d+$/.test(tok)) return false;
+      if (/^\d{1,2}$/.test(tok)) return false;
+      if (/^\d{2}:\d{2}$/.test(tok)) return false;
+      return true;
+    });
+
+  const addrToken = /\b(Airport|International|Hotel|Street|Road|Drive|Avenue|Place|Crescent|Terrace|Lane|Harbour|Quay|Terminal)\b/i;
+  const driverMatch =
+    row.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b(?!\s*(Road|Street|Drive|Avenue|Airport|Hotel|International))/);
+
+  let plate = '';
+  if (plateCandidates.length) {
+    if (driverMatch) {
+      const dIdx = row.indexOf(driverMatch[0]);
+      const aIdx = (() => {
+        const m = row.match(addrToken);
+        return m ? row.indexOf(m[0]) : -1;
+      })();
+      const between = plateCandidates.find(tok => {
+        const i = row.indexOf(tok);
+        return i > dIdx && (aIdx === -1 || i < aIdx);
+      });
+      plate = between || plateCandidates[0];
+    } else {
+      plate = plateCandidates[0];
     }
   }
 
-  return bookings;
-}
-
-// Function to create Excel file with multiple sheets
-function createExcelFile(bookings) {
-  const workbook = XLSX.utils.book_new();
-
-  // Create main sheet with all data
-  const mainData = bookings.map(booking => ({
-    'Booking No': booking.bookingNo,
-    'Accept date': booking.acceptDate,
-    'Ride date': booking.rideDate,
-    'Driver': booking.driver,
-    'License plate': booking.licensePlate,
-    'Pickup': booking.pickup,
-    'Destination': booking.destination,
-    'Net amount': booking.netAmount,
-    'Waiting charge': booking.waitingCharge,
-    'Added km': booking.addedKm,
-    'GST': booking.gst,
-    'Total': booking.total
-  }));
-
-  const mainSheet = XLSX.utils.json_to_sheet(mainData);
-  XLSX.utils.book_append_sheet(workbook, mainSheet, 'All Bookings');
-
-  // Group by license plate and create separate sheets
-  const groupedByLicense = {};
-  bookings.forEach(booking => {
-    const plate = booking.licensePlate || 'Unknown';
-    if (!groupedByLicense[plate]) {
-      groupedByLicense[plate] = [];
-    }
-    groupedByLicense[plate].push(booking);
+  // Monetary amounts near NZ$
+  const amounts = [...row.matchAll(/(-?\(?\d{1,3}(?:,\d{3})*\.\d{2}\)?)\s*NZ\$/g)].map((m) => {
+    let v = m[1].replace(/[(),]/g, '');
+    if (m[1].startsWith('(') && m[1].endsWith(')')) v = '-' + v;
+    return v;
   });
 
-  // Create sheets for each license plate
-  Object.keys(groupedByLicense).forEach(plate => {
-    const plateData = groupedByLicense[plate].map(booking => ({
-      'Booking No': booking.bookingNo,
-      'Accept date': booking.acceptDate,
-      'Ride date': booking.rideDate,
-      'Driver': booking.driver,
-      'Pickup': booking.pickup,
-      'Destination': booking.destination,
-      'Net amount': booking.netAmount,
-      'Waiting charge': booking.waitingCharge,
-      'Added km': booking.addedKm,
-      'GST': booking.gst,
-      'Total': booking.total
-    }));
+  // Address extraction
+  let pickup = '';
+  let destination = '';
+  const plateIdx = plate ? row.indexOf(plate) : -1;
+  const percentIdx = row.indexOf('%');
 
-    const plateSheet = XLSX.utils.json_to_sheet(plateData);
-    // Clean up sheet name for Excel compatibility
-    const sheetName = plate.replace(/[^\w\s]/gi, '').substring(0, 30);
-    XLSX.utils.book_append_sheet(workbook, plateSheet, sheetName || 'Unknown');
-  });
+  if (plateIdx >= 0) {
+    let right = row.slice(plateIdx + plate.length).trim();
+    if (percentIdx > plateIdx) right = row.slice(plateIdx + plate.length, percentIdx).trim();
 
-  return workbook;
+    const locToken =
+      /\b(Airport|International|Hotel|Street|Road|Drive|Avenue|Place|Crescent|Terrace|Lane|Harbour|Quay|Terminal)\b/i;
+    const first = right.search(locToken);
+    if (first >= 0) {
+      const rest = right.slice(first + 1);
+      const second = rest.search(locToken);
+      if (second >= 0) {
+        const mid = first + 1 + second;
+        pickup = right.slice(0, mid).trim();
+        destination = right.slice(mid).trim();
+      } else {
+        const mid = Math.floor(right.length / 2);
+        pickup = right.slice(0, mid).trim();
+        destination = right.slice(mid).trim();
+      }
+    } else {
+      pickup = right.trim();
+      destination = right.trim();
+    }
+  }
+
+  const [net = '0.00', waiting = '0.00', addKm = '0.00', /*netTotal*/, gst = '0.00', total = '0.00'] =
+    amounts;
+
+  const _isCreditRow = !booking && (/fee\s+for\s+ride\s+given\s+back|credit|refund/i.test(row));
+
+  return {
+    'Booking No': booking || 'CREDIT',
+    'Accept date': _isCreditRow ? (dates[0] ?? '') : (dates[0] ?? ''),
+    'Ride date': _isCreditRow ? (dates[1] ?? '').trim() : [dates[1] ?? '', rideTime].filter(Boolean).join(' ').trim(),
+    'Driver': _isCreditRow ? '—' : driver,
+    'License plate': _isCreditRow ? '—' : plate,
+    'Pickup': _isCreditRow ? 'Fee for ride given back' : pickup,
+    'Destination': _isCreditRow ? '' : destination,
+    'Net amount': net || '0.00',
+    'Waiting charge': waiting || '0.00',
+    'Added km': addKm || '0.00',
+    'GST': gst || '0.00',
+    'Total': total || '0.00',
+  };
 }
 
-// Endpoint to process PDF and return Excel
-app.post('/api/process-pdf', upload.single('pdfFile'), async (req, res) => {
-  try {
-    const { password } = req.body;
-    const file = req.file;
+/**
+ * Extract structured rows from all pages except the first
+ */
+function extractRowsFromPages(pages) {
+  const out = [];
 
-    // Validate password
-    if (password !== PDF_PROCESS_PASSWORD) {
-      // Clean up uploaded file
-      if (file && fs.existsSync(file.path)) {
-        fs.unlinkSync(file.path);
-      }
-      return res.status(401).json({ error: 'Invalid password' });
-    }
+  for (let p = 1; p < pages.length; p++) {
+    const lines = pageToLines(pages[p]);
 
-    // Validate file
-    if (!file) {
-      return res.status(400).json({ error: 'No PDF file uploaded' });
-    }
+    let current = '';
+    let inRow = false;
 
-    // Read and parse PDF
-    const pdfBuffer = fs.readFileSync(file.path);
-    const pdfData = await pdf(pdfBuffer);
+    for (const line of lines) {
+      const startsRow = /^\d+\s+\d{9}\b/.test(line);
+      const isFooter = /Subtotal|Total gross|Page \d+ of|\bSumme\b|Gesamtpreis/i.test(line);
 
-    console.log('PDF Text extracted, length:', pdfData.text.length);
-
-    // Parse the PDF data to extract bookings
-    const bookings = parsePDFData(pdfData.text);
-
-    console.log('Extracted bookings:', bookings.length);
-
-    if (bookings.length === 0) {
-      // Clean up
-      fs.unlinkSync(file.path);
-      return res.status(400).json({ error: 'No booking data found in PDF' });
-    }
-
-    // Create Excel file
-    const workbook = createExcelFile(bookings);
-
-    // Generate filename
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const excelFileName = `blacklane-bookings-${timestamp}.xlsx`;
-    const excelPath = path.join('uploads', excelFileName);
-
-    // Write Excel file
-    XLSX.writeFile(workbook, excelPath);
-
-    // Clean up PDF file
-    fs.unlinkSync(file.path);
-
-    // Send Excel file
-    res.download(excelPath, excelFileName, (err) => {
-      if (err) {
-        console.error('Download error:', err);
-        res.status(500).json({ error: 'Failed to download file' });
-      }
-      // Clean up Excel file after download
-      setTimeout(() => {
-        if (fs.existsSync(excelPath)) {
-          fs.unlinkSync(excelPath);
+      if (startsRow) {
+        if (current) {
+          const parsed = tryParseRow(current);
+          if (parsed) out.push(parsed);
         }
-      }, 60000); // Delete after 1 minute
-    });
+        current = line;
+        inRow = true;
+        continue;
+      }
 
-  } catch (error) {
-    console.error('PDF processing error:', error);
-
-    // Clean up uploaded file
-    if (req.file && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path);
+      if (inRow) {
+        if (isFooter) {
+          const parsed = tryParseRow(current);
+          if (parsed) out.push(parsed);
+          current = '';
+          inRow = false;
+        } else {
+          current += ' ' + line;
+        }
+      }
     }
 
-    res.status(500).json({
-      error: 'Failed to process PDF',
-      details: error.message
-    });
+    // Flush last buffered row on the page
+    if (current) {
+      const parsed = tryParseRow(current);
+      if (parsed) out.push(parsed);
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Convert extracted rows into an Excel workbook
+ */
+function rowsToWorkbook(rows) {
+  const wb = XLSX.utils.book_new();
+
+  const columns = [
+    'Booking No',
+    'Accept date',
+    'Ride date',
+    'Driver',
+    'License plate',
+    'Pickup',
+    'Destination',
+    'Net amount',
+    'Waiting charge',
+    'Added km',
+    'GST',
+    'Total',
+  ];
+
+  const all = XLSX.utils.json_to_sheet(rows, { header: columns });
+  all['!cols'] = [
+    { wch: 12 }, { wch: 12 }, { wch: 18 }, { wch: 22 }, { wch: 14 },
+    { wch: 50 }, { wch: 50 }, { wch: 12 }, { wch: 14 }, { wch: 10 },
+    { wch: 10 }, { wch: 12 },
+  ];
+  XLSX.utils.book_append_sheet(wb, all, 'All Data');
+
+  // Group by license plate
+  const grouped = new Map();
+  for (const r of rows) {
+    const key = r['License plate'] || 'Unknown';
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(r);
+  }
+
+  for (const [plate, list] of grouped.entries()) {
+    const safe = (plate || 'Unknown').replace(/[:\\\/?*\[\]]/g, '').slice(0, 31) || 'Unknown';
+    const sh = XLSX.utils.json_to_sheet(list, { header: columns });
+    sh['!cols'] = all['!cols'];
+    XLSX.utils.book_append_sheet(wb, sh, safe);
+  }
+
+  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+}
+
+// ------------------ API: PDF → Excel ------------------
+app.post('/api/convert-pdf', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file?.buffer) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const pages = await parsePDFFromBuffer(req.file.buffer);
+    if (!pages?.length || pages.length === 1) {
+      return res.status(400).json({ error: 'No tabular pages found (only cover page?).' });
+    }
+
+    const rows = extractRowsFromPages(pages);
+    if (!rows.length) {
+      return res.status(400).json({ error: 'No table rows found after skipping the first page.' });
+    }
+
+    const xlsxBuffer = rowsToWorkbook(rows);
+    const filename = `rides_${Date.now()}.xlsx`;
+
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    );
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', String(xlsxBuffer.length));
+    return res.status(200).send(xlsxBuffer);
+  } catch (err) {
+    console.error('Conversion failed:', err);
+    return res.status(500).json({ error: 'Failed to convert PDF. See server logs for details.' });
   }
 });
 
-// Endpoint to request a web-call access token
+// Endpoint to create a web call with Retell
 app.post('/api/create-web-call', async (req, res) => {
   try {
     if (!process.env.RETELL_API_KEY || !process.env.RETELL_AGENT_ID) {
@@ -255,7 +334,6 @@ app.post('/api/create-web-call', async (req, res) => {
       }
     });
 
-    // Send the access token back to the browser
     res.json({ accessToken: response.access_token });
   } catch (err) {
     console.error('Error creating web call:', err);
