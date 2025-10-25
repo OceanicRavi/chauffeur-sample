@@ -1,3 +1,4 @@
+// api/index.js
 import express from 'express';
 import { Retell } from 'retell-sdk';
 import cors from 'cors';
@@ -12,54 +13,38 @@ app.use(cors());
 app.use(express.json());
 
 // Set up multer for file uploads (in-memory)
-const upload = multer({ 
+const upload = multer({
   storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
-  }
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
 });
 
-// Initialize Retell client with your secret API key
-const retell = new Retell({
-  apiKey: process.env.RETELL_API_KEY,
-});
+// Retell client
+const retell = new Retell({ apiKey: process.env.RETELL_API_KEY });
 
 // ---------------------------------------------------------
-// ---------------- PDF → EXCEL LOGIC (from server.js) -----
+// ---------------- PDF → EXCEL LOGIC (Vercel-safe) --------
 // ---------------------------------------------------------
 
-/**
- * Parse PDF buffer with pdf2json and return raw Pages
- */
 function parsePDFFromBuffer(buf) {
   return new Promise((resolve, reject) => {
     const pdfParser = new PDFParser();
     pdfParser.on('pdfParser_dataError', (err) => reject(err?.parserError || err));
-    pdfParser.on('pdfParser_dataReady', (pdfData) => {
-      resolve(pdfData?.Pages ?? []);
-    });
+    pdfParser.on('pdfParser_dataReady', (pdfData) => resolve(pdfData?.Pages ?? []));
     pdfParser.parseBuffer(buf);
   });
 }
 
-/**
- * Decode a single pdf2json text item into a string
- */
 function decodeTextItem(t) {
   if (!t?.R) return '';
   return t.R.map((r) => decodeURIComponent(r?.T || '')).join(' ');
 }
 
-/**
- * Convert a Page into ordered text lines by grouping close Y values and sorting by X
- */
 function pageToLines(page) {
   if (!page?.Texts) return [];
   const items = page.Texts
     .map((t) => ({ x: t.x, y: t.y, s: decodeTextItem(t).trim() }))
     .filter((i) => i.s);
 
-  // group by y cluster (fixed precision); then order rows by y asc, and within row by x asc
   const rows = new Map();
   for (const it of items) {
     const key = it.y.toFixed(1);
@@ -75,83 +60,74 @@ function pageToLines(page) {
   return orderedLines;
 }
 
-/**
- * Try to parse one whole, multi-line row string into the exact columns requested
- */
-function tryParseRow(row) {
-  // Booking No: 9-digit id
-  const booking = (row.match(/\b\d{9}\b/) || [])[0] || '';
+// Money extractor (supports negatives and parentheses)
+function extractAmounts(row) {
+  // 12.34 NZ$, -12.34 NZ$, (12.34) NZ$
+  const matches = [...row.matchAll(/(-?\(?\d{1,3}(?:,\d{3})*\.\d{2}\)?)\s*NZ\$/g)];
+  return matches.map((m) => {
+    const raw = m[1];
+    const stripped = raw.replace(/[(),]/g, '');
+    if (raw.startsWith('(') && raw.endsWith(')')) return '-' + stripped;
+    return stripped;
+  });
+}
 
-  // Heuristic: allow "fee back / credit" style rows with no booking
-  const isCreditRow = /fee\s+for\s+ride\s+given\s+back|credit|refund/i.test(row);
+const DRIVER_RX =
+  /\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b(?!\s*(Road|Street|Drive|Avenue|Airport|Hotel|International))/;
 
-  if (!booking && !isCreditRow) return null;
+const ADDR_TOKEN =
+  /\b(Airport|International|Hotel|Street|Road|Drive|Avenue|Place|Crescent|Terrace|Lane|Harbour|Quay|Terminal)\b/i;
 
-  // Accept date / Ride date (yyyy-mm-dd), time (HH:mm)
-  const dates = row.match(/\b\d{4}-\d{2}-\d{2}\b/g) || [];
-  const rideTime = (row.match(/\b\d{2}:\d{2}\b/) || [])[0] || '';
-
-  // Driver: capitalized words (1–3) not colliding with address tokens
-  const driver =
-    (row.match(
-      /\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b(?!\s*(Road|Street|Drive|Avenue|Airport|Hotel|International))/,
-    ) || [])[0] || '';
-
-  // License plate: support personalized/all-letter plates
-  const plateCandidates = Array.from(row.matchAll(/\b[A-Z0-9]{2,8}\b/g))
-    .map(m => m[0])
-    .filter(tok => {
+function findLicensePlate(row, driverMatch) {
+  // allow 2–8 A-Z/0-9 with optional single hyphen (normalize by removing '-')
+  const CAND_RX = /\b[A-Z0-9]{1,4}-?[A-Z0-9]{1,4}\b/g;
+  const cands = Array.from(row.matchAll(CAND_RX))
+    .map((m) => m[0])
+    .filter((tok) => {
       if (/^\d+$/.test(tok)) return false;
-      if (/^\d{1,2}$/.test(tok)) return false;
       if (/^\d{2}:\d{2}$/.test(tok)) return false;
-      return true;
+      return tok.length >= 2 && tok.length <= 8;
     });
 
-  const addrToken = /\b(Airport|International|Hotel|Street|Road|Drive|Avenue|Place|Crescent|Terrace|Lane|Harbour|Quay|Terminal)\b/i;
-  const driverMatch =
-    row.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b(?!\s*(Road|Street|Drive|Avenue|Airport|Hotel|International))/);
-
-  let plate = '';
-  if (plateCandidates.length) {
-    if (driverMatch) {
-      const dIdx = row.indexOf(driverMatch[0]);
-      const aIdx = (() => {
-        const m = row.match(addrToken);
-        return m ? row.indexOf(m[0]) : -1;
-      })();
-      const between = plateCandidates.find(tok => {
-        const i = row.indexOf(tok);
-        return i > dIdx && (aIdx === -1 || i < aIdx);
-      });
-      plate = between || plateCandidates[0];
-    } else {
-      plate = plateCandidates[0];
-    }
+  if (!cands.length) return '';
+  if (driverMatch) {
+    const dIdx = row.indexOf(driverMatch[0]);
+    const m = row.match(ADDR_TOKEN);
+    const aIdx = m ? row.indexOf(m[0]) : -1;
+    const between = cands.find((tok) => {
+      const i = row.indexOf(tok);
+      return i > dIdx && (aIdx === -1 || i < aIdx);
+    });
+    return (between || cands[0]).replace('-', '');
   }
+  return cands[0].replace('-', '');
+}
 
-  // Monetary amounts near NZ$
-  const amounts = [...row.matchAll(/(-?\(?\d{1,3}(?:,\d{3})*\.\d{2}\)?)\s*NZ\$/g)].map((m) => {
-    let v = m[1].replace(/[(),]/g, '');
-    if (m[1].startsWith('(') && m[1].endsWith(')')) v = '-' + v;
-    return v;
-  });
+function tryParseRow(row) {
+  const booking = (row.match(/\b\d{9}\b/) || [])[0] || '';
+  const isCreditRow = /fee\s+for\s+ride\s+given\s+back|credit|refund/i.test(row);
+  if (!booking && !isCreditRow) return null;
 
-  // Address extraction
+  const dates = row.match(/\b\d{4}-\d{2}-\d{2}\b/g) || [];
+  const rideTime = (row.match(/\b\d{2}:\d{2}\b/) || [])[0] || '';
+  const driverMatch = row.match(DRIVER_RX);
+  const driver = driverMatch ? driverMatch[0] : '';
+  const plate = isCreditRow ? '—' : findLicensePlate(row, driverMatch);
+
+  // Address heuristics (slice after plate toward bonus/percent)
   let pickup = '';
   let destination = '';
   const plateIdx = plate ? row.indexOf(plate) : -1;
   const percentIdx = row.indexOf('%');
 
-  if (plateIdx >= 0) {
+  if (!isCreditRow && plateIdx >= 0) {
     let right = row.slice(plateIdx + plate.length).trim();
     if (percentIdx > plateIdx) right = row.slice(plateIdx + plate.length, percentIdx).trim();
 
-    const locToken =
-      /\b(Airport|International|Hotel|Street|Road|Drive|Avenue|Place|Crescent|Terrace|Lane|Harbour|Quay|Terminal)\b/i;
-    const first = right.search(locToken);
+    const first = right.search(ADDR_TOKEN);
     if (first >= 0) {
       const rest = right.slice(first + 1);
-      const second = rest.search(locToken);
+      const second = rest.search(ADDR_TOKEN);
       if (second >= 0) {
         const mid = first + 1 + second;
         pickup = right.slice(0, mid).trim();
@@ -167,36 +143,31 @@ function tryParseRow(row) {
     }
   }
 
+  // Amounts: [Net] [Waiting] [Add.km] [Net total] [GST] [Gross total]
+  const amounts = extractAmounts(row);
   const [net = '0.00', waiting = '0.00', addKm = '0.00', /*netTotal*/, gst = '0.00', total = '0.00'] =
     amounts;
 
-  const _isCreditRow = !booking && (/fee\s+for\s+ride\s+given\s+back|credit|refund/i.test(row));
-
   return {
     'Booking No': booking || 'CREDIT',
-    'Accept date': _isCreditRow ? (dates[0] ?? '') : (dates[0] ?? ''),
-    'Ride date': _isCreditRow ? (dates[1] ?? '').trim() : [dates[1] ?? '', rideTime].filter(Boolean).join(' ').trim(),
-    'Driver': _isCreditRow ? '—' : driver,
-    'License plate': _isCreditRow ? '—' : plate,
-    'Pickup': _isCreditRow ? 'Fee for ride given back' : pickup,
-    'Destination': _isCreditRow ? '' : destination,
-    'Net amount': net || '0.00',
-    'Waiting charge': waiting || '0.00',
-    'Added km': addKm || '0.00',
-    'GST': gst || '0.00',
-    'Total': total || '0.00',
+    'Accept date': dates[0] ?? '',
+    'Ride date': [dates[1] ?? '', rideTime].filter(Boolean).join(' ').trim(),
+    'Driver': isCreditRow ? '—' : driver,
+    'License plate': plate || (isCreditRow ? '—' : ''),
+    'Pickup': isCreditRow ? 'Fee for ride given back' : pickup,
+    'Destination': isCreditRow ? '' : destination,
+    'Net amount': net,
+    'Waiting charge': waiting,
+    'Added km': addKm,
+    'GST': gst,
+    'Total': total,
   };
 }
 
-/**
- * Extract structured rows from all pages except the first
- */
 function extractRowsFromPages(pages) {
   const out = [];
-
   for (let p = 1; p < pages.length; p++) {
     const lines = pageToLines(pages[p]);
-
     let current = '';
     let inRow = false;
 
@@ -225,20 +196,26 @@ function extractRowsFromPages(pages) {
         }
       }
     }
-
-    // Flush last buffered row on the page
     if (current) {
       const parsed = tryParseRow(current);
       if (parsed) out.push(parsed);
     }
   }
-
   return out;
 }
 
-/**
- * Convert extracted rows into an Excel workbook
- */
+// ---------- Excel helpers (numbers + formula totals) ----------
+
+function appendGrossTotalFormulaRow(sheet, columns, startRow, endRow) {
+  const totalIdx = columns.indexOf('Total');
+  if (totalIdx === -1) return;
+  const colLetter = XLSX.utils.encode_col(totalIdx); // 'L' if Total is last
+  const row = Array(columns.length).fill('');
+  row[0] = 'GROSS TOTAL';
+  row[totalIdx] = { f: `SUM(${colLetter}${startRow}:${colLetter}${endRow})` };
+  XLSX.utils.sheet_add_aoa(sheet, [row], { origin: -1 });
+}
+
 function rowsToWorkbook(rows) {
   const wb = XLSX.utils.book_new();
 
@@ -257,17 +234,38 @@ function rowsToWorkbook(rows) {
     'Total',
   ];
 
-  const all = XLSX.utils.json_to_sheet(rows, { header: columns });
+  // Coerce money columns to real Numbers so formulas work
+  const NUMERIC_COLS = ['Net amount', 'Waiting charge', 'Added km', 'GST', 'Total'];
+  const toNumber = (val) => {
+    if (val === null || val === undefined) return null;
+    const raw = String(val).trim();
+    if (!raw) return null;
+    const stripped = raw.replace(/[(),]/g, '');
+    const asNum = parseFloat(raw.startsWith('(') && raw.endsWith(')') ? '-' + stripped : stripped);
+    return Number.isFinite(asNum) ? asNum : null;
+  };
+  const numericRows = rows.map((r) => {
+    const copy = { ...r };
+    for (const k of NUMERIC_COLS) copy[k] = toNumber(copy[k]);
+    return copy;
+  });
+
+  // All Data
+  const all = XLSX.utils.json_to_sheet(numericRows, { header: columns });
   all['!cols'] = [
     { wch: 12 }, { wch: 12 }, { wch: 18 }, { wch: 22 }, { wch: 14 },
     { wch: 50 }, { wch: 50 }, { wch: 12 }, { wch: 14 }, { wch: 10 },
     { wch: 10 }, { wch: 12 },
   ];
   XLSX.utils.book_append_sheet(wb, all, 'All Data');
+  if (numericRows.length > 0) {
+    // header is row 1; data starts row 2
+    appendGrossTotalFormulaRow(all, columns, 2, numericRows.length + 1);
+  }
 
-  // Group by license plate
+  // Per-plate sheets
   const grouped = new Map();
-  for (const r of rows) {
+  for (const r of numericRows) {
     const key = r['License plate'] || 'Unknown';
     if (!grouped.has(key)) grouped.set(key, []);
     grouped.get(key).push(r);
@@ -278,9 +276,12 @@ function rowsToWorkbook(rows) {
     const sh = XLSX.utils.json_to_sheet(list, { header: columns });
     sh['!cols'] = all['!cols'];
     XLSX.utils.book_append_sheet(wb, sh, safe);
+    if (list.length > 0) {
+      appendGrossTotalFormulaRow(sh, columns, 2, list.length + 1);
+    }
   }
 
-  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx', cellFormula: true });
 }
 
 // ------------------ API: PDF → Excel ------------------
@@ -303,10 +304,7 @@ app.post('/api/convert-pdf', upload.single('file'), async (req, res) => {
     const xlsxBuffer = rowsToWorkbook(rows);
     const filename = `rides_${Date.now()}.xlsx`;
 
-    res.setHeader(
-      'Content-Type',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    );
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Content-Length', String(xlsxBuffer.length));
     return res.status(200).send(xlsxBuffer);
@@ -316,39 +314,33 @@ app.post('/api/convert-pdf', upload.single('file'), async (req, res) => {
   }
 });
 
-// Endpoint to create a web call with Retell
+// ------------------ Retell: create web call ------------
 app.post('/api/create-web-call', async (req, res) => {
   try {
     if (!process.env.RETELL_API_KEY || !process.env.RETELL_AGENT_ID) {
       return res.status(500).json({
-        error: 'Retell API credentials not configured. Please set RETELL_API_KEY and RETELL_AGENT_ID in your environment variables.'
+        error:
+          'Retell API credentials not configured. Please set RETELL_API_KEY and RETELL_AGENT_ID in your environment variables.',
       });
     }
 
-    const agentId = process.env.RETELL_AGENT_ID;
     const response = await retell.call.createWebCall({
-      agent_id: agentId,
-      metadata: {
-        source: 'chauffeur_website',
-        timestamp: new Date().toISOString()
-      }
+      agent_id: process.env.RETELL_AGENT_ID,
+      metadata: { source: 'chauffeur_website', timestamp: new Date().toISOString() },
     });
 
     res.json({ accessToken: response.access_token });
   } catch (err) {
     console.error('Error creating web call:', err);
-    res.status(500).json({
-      error: 'Failed to create web call',
-      details: err.message
-    });
+    res.status(500).json({ error: 'Failed to create web call', details: err.message });
   }
 });
 
-// Health check endpoint
+// ------------------ Health check -----------------------
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    retellConfigured: !!(process.env.RETELL_API_KEY && process.env.RETELL_AGENT_ID)
+    retellConfigured: !!(process.env.RETELL_API_KEY && process.env.RETELL_AGENT_ID),
   });
 });
 
